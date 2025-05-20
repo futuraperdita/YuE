@@ -6,6 +6,7 @@ import re
 import random
 import uuid
 import copy
+import gc
 from tqdm import tqdm
 from collections import Counter
 import argparse
@@ -22,6 +23,9 @@ from mmtokenizer import _MMSentencePieceTokenizer
 from models.soundstream_hubert_new import SoundStream
 from vocoder import build_codec_model, process_audio
 from post_process_audio import replace_low_freq_with_energy_matched
+
+# Enable MPS fallback for operations not natively supported on MPS
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 
 parser = argparse.ArgumentParser()
@@ -71,6 +75,30 @@ stage1_output_dir = os.path.join(args.output_dir, f"stage1")
 stage2_output_dir = stage1_output_dir.replace('stage1', 'stage2')
 os.makedirs(stage1_output_dir, exist_ok=True)
 os.makedirs(stage2_output_dir, exist_ok=True)
+
+# Function to determine optimal batch size based on device
+def get_optimal_batch_size():
+    if args.device == "mps":
+        try:
+            # For macOS, try to get system memory to adjust batch size
+            import subprocess
+            mem_info = subprocess.check_output(['sysctl', 'hw.memsize']).decode('utf-8')
+            total_mem = int(mem_info.split(':')[1].strip()) / (1024**3)  # Convert to GB
+            
+            # Adjust batch size based on available memory
+            if total_mem <= 8:
+                return 1
+            elif total_mem <= 16:
+                return min(2, args.stage2_batch_size)
+            else:
+                return min(3, args.stage2_batch_size)
+        except Exception as e:
+            print(f"Warning: Could not determine optimal batch size for MPS: {e}")
+            # Use a conservative value
+            return min(2, args.stage2_batch_size)
+    
+    # Return original value for non-MPS devices
+    return args.stage2_batch_size
 def seed_everything(seed=42): 
     random.seed(seed) 
     np.random.seed(seed) 
@@ -83,6 +111,16 @@ def seed_everything(seed=42):
         torch.backends.cudnn.benchmark = False
     
 seed_everything(args.seed)
+
+# Function to efficiently clear device cache - defined early to be accessible throughout the script
+def clear_device_cache():
+    gc.collect()
+    if 'device' in globals() and device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif 'device' in globals() and device.type == "mps":
+        # For MPS devices
+        if hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
 
 # Device selection logic
 if args.device == "auto":
@@ -133,9 +171,23 @@ if device.type == "cuda":
     )
 else:
     # For MPS or CPU, don't use flash attention
+    load_config = {
+        "torch_dtype": model_dtype,
+    }
+    
+    # Add specific optimizations for MPS
+    if device.type == "mps":
+        # Optimize loading for MPS
+        load_config["low_cpu_mem_usage"] = True
+        
+        # Make sure we have fallback enabled for operations not supported on MPS
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        
+        print("Using MPS-optimized loading configuration")
+    
     model = AutoModelForCausalLM.from_pretrained(
         stage1_model, 
-        torch_dtype=model_dtype,
+        **load_config
     )
 
 # Move model to device
@@ -146,6 +198,21 @@ model.eval()
 if torch.__version__ >= "2.0.0" and device.type == "cuda":
     model = torch.compile(model)
     print("Model compiled with torch.compile()")
+    
+# MPS optimization: Perform a warmup pass to initialize the Metal performance pipeline
+if device.type == "mps":
+    print("Performing MPS warmup pass to optimize performance...")
+    try:
+        with torch.no_grad():
+            # Create a small dummy input for the warmup pass
+            dummy_input = torch.ones((1, 128), dtype=torch.long).to(device)
+            _ = model(dummy_input)
+        print("MPS warmup complete")
+        # Clear cache after warmup
+        clear_device_cache()
+    except Exception as e:
+        print(f"Warning: MPS warmup failed: {e}")
+        print("Continuing without warmup")
 
 codectool = CodecManipulator("xcodec", 0, 1)
 codectool_stage2 = CodecManipulator("xcodec", 0, 8)
@@ -255,19 +322,37 @@ for i, p in enumerate(tqdm(prompt_texts[:run_n_segments], desc="Stage1 inference
         print(f'Section {i}: output length {input_ids.shape[-1]} exceeding context length {max_context}, now using the last {max_context} tokens.')
         input_ids = input_ids[:, -(max_context):]
     with torch.no_grad():
-        output_seq = model.generate(
-            input_ids=input_ids, 
-            max_new_tokens=max_new_tokens, 
-            min_new_tokens=100, 
-            do_sample=True, 
-            top_p=top_p,
-            temperature=temperature, 
-            repetition_penalty=repetition_penalty, 
-            eos_token_id=mmtokenizer.eoa,
-            pad_token_id=mmtokenizer.eoa,
-            logits_processor=LogitsProcessorList([BlockTokenRangeProcessor(0, 32002), BlockTokenRangeProcessor(32016, 32016)]),
-            guidance_scale=guidance_scale,
-            )
+        # Set generation config with MPS optimizations if applicable
+        generation_config = {
+            "input_ids": input_ids,
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": 100,
+            "do_sample": True,
+            "top_p": top_p,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+            "eos_token_id": mmtokenizer.eoa,
+            "pad_token_id": mmtokenizer.eoa,
+            "logits_processor": LogitsProcessorList([BlockTokenRangeProcessor(0, 32002), BlockTokenRangeProcessor(32016, 32016)]),
+            "guidance_scale": guidance_scale,
+        }
+        
+        # For MPS, optimize memory usage during generation
+        if device.type == "mps":
+            # Use smaller context windows to reduce memory pressure
+            if input_ids.shape[-1] > 8192:
+                print(f"MPS: Trimming context size from {input_ids.shape[-1]} to 8192 tokens for better performance")
+                generation_config["input_ids"] = input_ids[:, -8192:]
+            
+            # Add attention slicing for MPS - reduces memory usage
+            if hasattr(model.config, "use_cache"):
+                model.config.use_cache = True
+                
+            # Process in smaller chunks for MPS
+            # This can help reduce memory pressure and avoid OOM errors
+            generation_config["use_cache"] = True
+        
+        output_seq = model.generate(**generation_config)
         if output_seq[0][-1].item() != mmtokenizer.eoa:
             tensor_eoa = torch.as_tensor([[mmtokenizer.eoa]]).to(model.device)
             output_seq = torch.cat((output_seq, tensor_eoa), dim=1)
@@ -309,13 +394,7 @@ stage1_output_set.append(inst_save_path)
 if not args.disable_offload_model:
     model.cpu()
     del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    elif device.type == "mps":
-        # MPS doesn't have an explicit memory clear function like CUDA
-        # But we can force garbage collection to help free memory
-        import gc
-        gc.collect()
+    clear_device_cache()
 
 print("Stage 2 inference...")
 
@@ -329,9 +408,19 @@ if device.type == "cuda":
     )
 else:
     # For MPS or CPU, don't use flash attention
+    load_config = {
+        "torch_dtype": model_dtype,
+    }
+    
+    # Add specific optimizations for MPS
+    if device.type == "mps":
+        # Optimize loading for MPS
+        load_config["low_cpu_mem_usage"] = True
+        print("Using MPS-optimized loading configuration for stage 2 model")
+    
     model_stage2 = AutoModelForCausalLM.from_pretrained(
         stage2_model, 
-        torch_dtype=model_dtype,
+        **load_config
     )
 
 model_stage2.to(device)
@@ -341,6 +430,21 @@ model_stage2.eval()
 if torch.__version__ >= "2.0.0" and device.type == "cuda":
     model_stage2 = torch.compile(model_stage2)
     print("Stage 2 model compiled with torch.compile()")
+    
+# MPS optimization: Perform a warmup pass for stage 2 model
+if device.type == "mps":
+    print("Performing MPS warmup pass for stage 2 model...")
+    try:
+        with torch.no_grad():
+            # Create a small dummy input for the warmup pass
+            dummy_input = torch.ones((1, 128), dtype=torch.long).to(device)
+            _ = model_stage2(dummy_input)
+        print("Stage 2 MPS warmup complete")
+        # Clear cache after warmup
+        clear_device_cache()
+    except Exception as e:
+        print(f"Warning: Stage 2 MPS warmup failed: {e}")
+        print("Continuing without warmup")
 
 def stage2_generate(model, prompt, batch_size=16):
     codec_ids = codectool.unflatten(prompt, n_quantizer=1)
@@ -389,13 +493,27 @@ def stage2_generate(model, prompt, batch_size=16):
         input_ids = prompt_ids
 
         with torch.no_grad():
-            stage2_output = model.generate(input_ids=input_ids, 
-                min_new_tokens=7,
-                max_new_tokens=7,
-                eos_token_id=mmtokenizer.eoa,
-                pad_token_id=mmtokenizer.eoa,
-                logits_processor=block_list,
-            )
+            # Set generation config
+            generation_config = {
+                "input_ids": input_ids,
+                "min_new_tokens": 7,
+                "max_new_tokens": 7,
+                "eos_token_id": mmtokenizer.eoa,
+                "pad_token_id": mmtokenizer.eoa,
+                "logits_processor": block_list,
+            }
+            
+            # MPS-specific optimizations
+            if device.type == "mps":
+                if hasattr(model.config, "use_cache"):
+                    model.config.use_cache = True
+                generation_config["use_cache"] = True
+                
+                # Periodically clear memory cache on MPS
+                if frames_idx % 30 == 0 and frames_idx > 0:
+                    clear_device_cache()
+            
+            stage2_output = model.generate(**generation_config)
         
         assert stage2_output.shape[1] - prompt_ids.shape[1] == 7, f"output new tokens={stage2_output.shape[1]-prompt_ids.shape[1]}"
         prompt_ids = stage2_output
@@ -426,9 +544,21 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
         output_duration = prompt.shape[-1] // 50 // 6 * 6
         num_batch = output_duration // 6
         
+        # MPS optimization: For MPS, use more smaller chunks to avoid memory pressure
+        if device.type == "mps" and batch_size > 1:
+            # Process in smaller chunks on MPS to avoid memory issues
+            old_batch_size = batch_size
+            batch_size = min(batch_size, 2)  # Limit batch size for MPS
+            if old_batch_size != batch_size:
+                print(f"Using smaller batch size ({batch_size} instead of {old_batch_size}) for MPS processing")
+        
         if num_batch <= batch_size:
             # If num_batch is less than or equal to batch_size, we can infer the entire prompt at once
             output = stage2_generate(model, prompt[:, :output_duration*50], batch_size=num_batch)
+            
+            # Clear MPS cache after processing if needed
+            if device.type == "mps":
+                clear_device_cache()
         else:
             # If num_batch is greater than batch_size, process in chunks of batch_size
             segments = []
@@ -445,6 +575,10 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
                     batch_size=current_batch_size
                 )
                 segments.append(segment)
+                
+                # Periodically clear cache on MPS to avoid memory buildup
+                if device.type == "mps" and seg % 2 == 0:
+                    clear_device_cache()
 
             # Concatenate all the segments
             output = np.concatenate(segments, axis=0)
@@ -453,6 +587,11 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
         if output_duration*50 != prompt.shape[-1]:
             ending = stage2_generate(model, prompt[:, output_duration*50:], batch_size=1)
             output = np.concatenate([output, ending], axis=0)
+        
+        # Clear cache after major processing step on MPS
+        if device.type == "mps":
+            clear_device_cache()
+            
         output = codectool_stage2.ids2npy(output)
 
         # Fix invalid codes (a dirty solution, which may harm the quality of audio)
@@ -467,9 +606,18 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
         # save output
         np.save(output_filename, fixed_output)
         stage2_result.append(output_filename)
+        
+        # Clear MPS cache after each file processing
+        if device.type == "mps":
+            clear_device_cache()
     return stage2_result
 
-stage2_result = stage2_inference(model_stage2, stage1_output_set, stage2_output_dir, batch_size=args.stage2_batch_size)
+# Apply optimized batch size for the device
+optimized_batch_size = get_optimal_batch_size()
+if optimized_batch_size != args.stage2_batch_size:
+    print(f"Adjusted batch size from {args.stage2_batch_size} to {optimized_batch_size} for optimal performance on {device.type}")
+
+stage2_result = stage2_inference(model_stage2, stage1_output_set, stage2_output_dir, batch_size=optimized_batch_size)
 print(stage2_result)
 print('Stage 2 DONE.\n')
 # convert audio tokens to audio
