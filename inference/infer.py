@@ -46,7 +46,8 @@ parser.add_argument("--instrumental_track_prompt_path", type=str, default="", he
 parser.add_argument("--output_dir", type=str, default="./output", help="The directory where generated outputs will be saved.")
 parser.add_argument("--keep_intermediate", action="store_true", help="If set, intermediate outputs will be saved during processing.")
 parser.add_argument("--disable_offload_model", action="store_true", help="If set, the model will not be offloaded from the GPU to CPU after Stage 1 inference.")
-parser.add_argument("--cuda_idx", type=int, default=0)
+parser.add_argument("--cuda_idx", type=int, default=0, help="CUDA device index to use (when using CUDA).")
+parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"], help="Device to use for inference. 'auto' will use MPS on Mac, CUDA if available, otherwise CPU.")
 parser.add_argument("--seed", type=int, default=42, help="An integer value to reproduce generation.")
 # Config for xcodec and upsampler
 parser.add_argument('--basic_model_config', default='./xcodec_mini_infer/final_ckpt/config.yaml', help='YAML files for xcodec configurations.')
@@ -73,26 +74,78 @@ os.makedirs(stage2_output_dir, exist_ok=True)
 def seed_everything(seed=42): 
     random.seed(seed) 
     np.random.seed(seed) 
-    torch.manual_seed(seed) 
-    torch.cuda.manual_seed_all(seed) 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.manual_seed(seed)
+    
+    # Set CUDA seeds if available
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed) 
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
 seed_everything(args.seed)
-# load tokenizer and model
-device = torch.device(f"cuda:{cuda_idx}" if torch.cuda.is_available() else "cpu")
+
+# Device selection logic
+if args.device == "auto":
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using MPS device for inference")
+    elif torch.cuda.is_available():
+        device = torch.device(f"cuda:{cuda_idx}")
+        print(f"Using CUDA device {cuda_idx} for inference")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU device for inference")
+elif args.device == "cuda":
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{cuda_idx}")
+        print(f"Using CUDA device {cuda_idx} for inference")
+    else:
+        print("CUDA requested but not available. Falling back to CPU.")
+        device = torch.device("cpu")
+elif args.device == "mps":
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using MPS device for inference")
+    else:
+        print("MPS requested but not available. Falling back to CPU.")
+        device = torch.device("cpu")
+else:
+    device = torch.device("cpu")
+    print("Using CPU device for inference")
 mmtokenizer = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model")
-model = AutoModelForCausalLM.from_pretrained(
-    stage1_model, 
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2", # To enable flashattn, you have to install flash-attn
-    # device_map="auto",
+
+# Determine appropriate dtype for the device
+if device.type == "mps":
+    # MPS doesn't support bfloat16 yet, use float16 instead
+    model_dtype = torch.float16
+    print("Using float16 precision for MPS device")
+else:
+    model_dtype = torch.bfloat16
+    print(f"Using bfloat16 precision for {device.type} device")
+
+# Load model with appropriate configuration based on device
+if device.type == "cuda":
+    model = AutoModelForCausalLM.from_pretrained(
+        stage1_model, 
+        torch_dtype=model_dtype,
+        attn_implementation="flash_attention_2", # To enable flashattn, you have to install flash-attn
+        # device_map="auto",
     )
-# to device, if gpu is available
+else:
+    # For MPS or CPU, don't use flash attention
+    model = AutoModelForCausalLM.from_pretrained(
+        stage1_model, 
+        torch_dtype=model_dtype,
+    )
+
+# Move model to device
 model.to(device)
 model.eval()
 
-if torch.__version__ >= "2.0.0":
+# Torch compile is only supported on CUDA for now
+if torch.__version__ >= "2.0.0" and device.type == "cuda":
     model = torch.compile(model)
+    print("Model compiled with torch.compile()")
 
 codectool = CodecManipulator("xcodec", 0, 1)
 codectool_stage2 = CodecManipulator("xcodec", 0, 8)
@@ -256,20 +309,38 @@ stage1_output_set.append(inst_save_path)
 if not args.disable_offload_model:
     model.cpu()
     del model
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        # MPS doesn't have an explicit memory clear function like CUDA
+        # But we can force garbage collection to help free memory
+        import gc
+        gc.collect()
 
 print("Stage 2 inference...")
-model_stage2 = AutoModelForCausalLM.from_pretrained(
-    stage2_model, 
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    # device_map="auto",
+
+# Load stage 2 model with appropriate configuration based on device
+if device.type == "cuda":
+    model_stage2 = AutoModelForCausalLM.from_pretrained(
+        stage2_model, 
+        torch_dtype=model_dtype,
+        attn_implementation="flash_attention_2",
+        # device_map="auto",
     )
+else:
+    # For MPS or CPU, don't use flash attention
+    model_stage2 = AutoModelForCausalLM.from_pretrained(
+        stage2_model, 
+        torch_dtype=model_dtype,
+    )
+
 model_stage2.to(device)
 model_stage2.eval()
 
-if torch.__version__ >= "2.0.0":
+# Torch compile is only supported on CUDA for now
+if torch.__version__ >= "2.0.0" and device.type == "cuda":
     model_stage2 = torch.compile(model_stage2)
+    print("Stage 2 model compiled with torch.compile()")
 
 def stage2_generate(model, prompt, batch_size=16):
     codec_ids = codectool.unflatten(prompt, n_quantizer=1)
